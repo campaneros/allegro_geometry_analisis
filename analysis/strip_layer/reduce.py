@@ -1,49 +1,54 @@
-import sys, math, os
-import numpy as np, uproot, awkward as ak
+import os
+import sys
+import numpy as np
+import uproot
 
-DIRS = {"baseline": "/eos/experiment/drd/drd6/allegro/noble-liquid-cal-rnd/simulation_output/baseline",
-        "front": "/eos/experiment/drd/drd6/allegro/noble-liquid-cal-rnd/simulation_output/solenoid_front_studies"}
+BASE = "/eos/experiment/drd/drd6/allegro/noble-liquid-cal-rnd/simulation_output"
+DIRS = {"baseline": f"{BASE}/baseline", "front": f"{BASE}/solenoid_front_studies"}
 OUT = "/eos/user/m/mcampana/ALLEGRO/analysis/strip_layer/reduced"
 GRID, OFFSET, HALF = 0.009817477 / 4, 0.5902785, 30
-conf, part, E = sys.argv[1], sys.argv[2], sys.argv[3]
-nev = int(sys.argv[4]) if len(sys.argv) > 4 else 5000
-f = f"{DIRS[conf]}/stripseverywhere_reco_LArPb_10k_{part}_{E}GeV.root"
-C, M = "EMBCaloClusterCells", "MCParticles"
-br = [f"{C}/{C}.cellID", f"{C}/{C}.energy", f"{C}/{C}.position.x", f"{C}/{C}.position.y"] + \
-     [f"{M}/{M}.{v}" for v in ("PDG", "momentum.x", "momentum.y", "momentum.z", "vertex.x", "vertex.y", "vertex.z")]
 NB = 2 * HALF + 1
-prof, frac, truth, rho_sum, rho_w = [], [], [], np.zeros(11), np.zeros(11)
-t = uproot.open(f)["events"]
-for a in t.iterate(br, entry_stop=nev, step_size=500, library="ak"):
-    for ev in range(len(a)):
-        pdg = np.asarray(a[br[4]][ev]); px, py, pz = (np.asarray(a[b][ev]) for b in br[5:8])
-        vr = np.sqrt(sum(np.asarray(a[b][ev]) ** 2 for b in br[8:11]))
-        th0 = math.atan2(math.hypot(px[0], py[0]), pz[0]); ph0 = math.atan2(py[0], px[0])
-        u = (th0 - OFFSET) / GRID; u0 = round(u)
-        tr = [th0, ph0, math.sqrt(px[0] ** 2 + py[0] ** 2 + pz[0] ** 2), 0, 0, 0]
-        if pdg[0] == 111:
-            g = np.where((pdg == 22) & (vr < 1.))[0][:2]
-            if len(g) == 2:
-                p1, p2 = (np.array([px[i], py[i], pz[i]]) for i in g)
-                e1, e2 = np.linalg.norm(p1), np.linalg.norm(p2)
-                tr[3:] = [min(e1, e2), max(e1, e2), math.acos(np.clip(p1 @ p2 / e1 / e2, -1, 1))]
-        cid = np.asarray(a[br[0]][ev]).astype(np.uint64); en = np.asarray(a[br[1]][ev])
-        cid, iu = np.unique(cid, return_index=True); en = en[iu]
-        x, y = np.asarray(a[br[2]][ev])[iu], np.asarray(a[br[3]][ev])[iu]
-        lay = ((cid >> np.uint64(11)) & np.uint64(0xFF)).astype(int); th = ((cid >> np.uint64(30)) & np.uint64(0x3FF)).astype(int)
-        p = np.zeros((11, NB))
-        for l in range(11):
-            m = lay == l
-            if not m.any(): continue
-            rho_sum[l] += (np.hypot(x[m], y[m]) * en[m]).sum(); rho_w[l] += en[m].sum()
-            if l == 0:
-                k = (th[m][:, None] + np.arange(4)[None] - u0 + HALF).ravel(); w = np.repeat(en[m] / 4, 4)
-            else:
-                k = th[m] - u0 + HALF; w = en[m]
-            ok = (k >= 0) & (k < NB)
-            p[l] = np.bincount(k[ok], weights=w[ok], minlength=NB)
-        prof.append(p.astype(np.float32)); frac.append(u - u0); truth.append(tr)
+
+conf, part, E = sys.argv[1:4]
+nev = int(sys.argv[4]) if len(sys.argv) > 4 else 5000
+C, M = "EMBCaloClusterCells/EMBCaloClusterCells.", "MCParticles/MCParticles."
+names = [C + v for v in ("cellID", "energy", "position.x", "position.y")] + \
+        [M + v for v in ("PDG", "momentum.x", "momentum.y", "momentum.z", "vertex.x", "vertex.y", "vertex.z")]
+a = uproot.open(f"{DIRS[conf]}/stripseverywhere_reco_LArPb_10k_{part}_{E}GeV.root")["events"].arrays(
+    names, entry_stop=nev, library="np")
+
 os.makedirs(OUT, exist_ok=True)
-np.savez_compressed(f"{OUT}/{conf}_{part}_{E}GeV.npz", prof=np.array(prof), ufrac=np.array(frac), truth=np.array(truth),
-                    rho=rho_sum / np.maximum(rho_w, 1e-12) / 10.)
-print(conf, part, E, len(prof))
+n = len(a[names[0]])
+prof = np.zeros((n, 11, NB), np.float32)
+theta, alpha, egam = np.zeros(n), np.zeros(n), np.zeros((n, 2))
+rho_sum, e_sum = np.zeros(11), np.zeros(11)
+for i in range(n):
+    pdg = a[M + "PDG"][i]
+    p = np.stack([a[M + "momentum." + c][i] for c in "xyz"], 1)
+    theta[i] = np.arctan2(np.hypot(p[0, 0], p[0, 1]), p[0, 2])
+    if pdg[0] == 111:
+        r = np.sqrt(sum(a[M + "vertex." + c][i] ** 2 for c in "xyz"))
+        g = np.where((pdg == 22) & (r < 1))[0][:2]
+        if len(g) == 2:
+            e = np.linalg.norm(p[g], axis=1)
+            egam[i] = np.sort(e)
+            alpha[i] = np.arccos(np.clip(p[g[0]] @ p[g[1]] / e[0] / e[1], -1, 1))
+
+    cid, first = np.unique(a[C + "cellID"][i].astype(np.uint64), return_index=True)
+    en = a[C + "energy"][i][first]
+    rho = np.hypot(a[C + "position.x"][i][first], a[C + "position.y"][i][first]) / 10
+    lay = ((cid >> np.uint64(11)) & np.uint64(0xFF)).astype(int)
+    k = ((cid >> np.uint64(30)) & np.uint64(0x3FF)).astype(int) - round((theta[i] - OFFSET) / GRID) + HALF
+    np.add.at(rho_sum, lay, rho * en)
+    np.add.at(e_sum, lay, en)
+
+    pre = lay == 0
+    lay = np.r_[lay[~pre], np.zeros(4 * pre.sum(), int)]
+    k = np.r_[k[~pre], (k[pre, None] + np.arange(4)).ravel()]
+    en = np.r_[en[~pre], np.repeat(en[pre] / 4, 4)]
+    ok = (k >= 0) & (k < NB)
+    np.add.at(prof[i], (lay[ok], k[ok]), en[ok])
+
+np.savez_compressed(f"{OUT}/{conf}_{part}_{E}GeV.npz", prof=prof, theta=theta, alpha=alpha, egam=egam,
+                    rho=rho_sum / np.maximum(e_sum, 1e-12))
+print(conf, part, E, n)
