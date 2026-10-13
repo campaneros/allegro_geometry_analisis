@@ -1,0 +1,8 @@
+/*
+!/.gitignore
+!/README.md
+!/analysis/
+
+__pycache__/
+*.log
+*.root
