@@ -16,6 +16,8 @@ The simulation and reconstruction scripts will live in a separate repository.
 analysis/strip_layer/
     reduce.py    reco files -> per-event theta profiles at strip granularity + MC truth
     analyse.py   builds the designs from the reduced files and makes all the plots
+    compare_reco.py  checks the variables against the FCC reconstruction (AugmentClustersFCCee) on the
+                     ALLEGRO_strips design samples
 ```
 
 ### Inputs
@@ -75,6 +77,12 @@ Designs compared:
   - a scan of W0 between 2 and 7 for the log-weighted methods.
   The radial position of a cell is the centre of its layer, so the depth of the shower inside a layer cannot be
   used event by event;
+- comparison with the FCC reconstruction (`compare_reco.py`, plots `09_reco_compare_*`): on the same clusters of
+  the ALLEGRO_strips design samples (theta = 90 deg) a copy of the AugmentClustersFCCee formulas reproduces the reco
+  values exactly, which validates how the cells are read. It also shows that in the release used (key4hep 2026-04-08)
+  the shape variables of AugmentClustersFCCee (Eratio, Delta E, 3-9 bin widths, side fractions) are wrong in every
+  layer read with merged cells: the theta profile is zero-filled at every theta index instead of every merged cell,
+  so each cell looks like an isolated maximum. Only the strip layers are right. Do not use those variables;
 - energy: response and resolution of the leading sliding-window cluster for the two configurations, and the check
   that the resolution does not depend on where the strips are.
 
