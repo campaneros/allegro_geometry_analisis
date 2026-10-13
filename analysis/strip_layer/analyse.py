@@ -24,6 +24,11 @@ XLAB = "depth inside the ECAL [$X_0$]"
 LAYERS = (1, 2, 3, 4, 5, 6)
 DESIGNS = [("no strips", ())] + [(f"strips only in layer {L}", (L,)) for L in LAYERS] + [("strips in layers 1-6", LAYERS)]
 VARS = ["Eratio", "dE", "w_s3", "w_tot", "f_side", "E2/E"]
+W0 = 4.0
+METHODS = {"fit": "line fit, S-curve, mean layer weights (07)", "fit_event": "line fit, per-event layer weights",
+           "vertex": "line fit through z = 0 (vertex constrained)", "log": f"log-weight barycentres (W0={W0}) + line fit",
+           "pca_layer": "PCA of the S-corrected layer barycentres", "pca_hits": "PCA of all hits, S-corrected, energy weights",
+           "pca_hits_log": f"PCA of all hits, S-corrected, log weights (W0={W0})"}
 
 
 def style(strips):
@@ -126,33 +131,85 @@ def bdt(conf, E, strips):
                 score=score, y=y, cut=cut, X=X, names=names, model=models[0], test=~half)
 
 
-def dz(d, l, strip):
+def log_weights(q, total, w0):
+    return np.where(q > 0, np.maximum(0, w0 + np.log(np.maximum(q, 1e-12) / total[:, None])), 0)
+
+
+def barycentre(d, l, strip, w0=None):
     q, pos, step = readout(d, l, strip)
     c = pos[np.arange(len(q)), np.argmax(np.where(np.abs(pos) <= 12, q, -1e9), 1)]
-    w = np.where(np.abs(pos - c[:, None]) <= (5 if strip else 4.1), q, 0)
-    ub = d["u0"] + (w * pos).sum(1) / (w.sum(1) + 1e-12)
+    if w0 is None:
+        w = np.where(np.abs(pos - c[:, None]) <= (5 if strip else 4.1), q, 0)
+    else:
+        q = np.where(np.abs(pos - c[:, None]) <= 16, q, 0)
+        w = log_weights(q, q.sum(1), w0)
+    ub = d["u0"] + np.where(w.sum(1) > 0, (w * pos).sum(1) / np.maximum(w.sum(1), 1e-12), np.nan)
+    if w0 is not None:
+        return ub, np.zeros(len(ub))
     res = ub - d["u"]
-    b = (np.mod(ub + 0.5, step) / step * 20).astype(int).clip(0, 19)
-    corr = np.array([np.median(res[d["even"] & (b == i)]) if (d["even"] & (b == i)).sum() > 5 else 0 for i in range(20)])
-    return -(res - corr[b]) * GRID * d["rho"][l] / np.sin(d["theta"]) ** 2
+    b = (np.mod(np.nan_to_num(ub) + 0.5, step) / step * 20).astype(int).clip(0, 19)
+    corr = np.array([np.nanmedian(res[d["even"] & (b == i)]) if (d["even"] & (b == i)).sum() > 5 else 0 for i in range(20)])
+    return ub - corr[b], corr[b]
+
+
+def dz(d, l, strip, w0=None):
+    return -(barycentre(d, l, strip, w0)[0] - d["u"]) * GRID * d["rho"][l] / np.sin(d["theta"]) ** 2
+
+
+def principal_axis(rho, z, w, axis):
+    sw = w.sum(axis)
+    rm, zm = (w * rho).sum(axis) / sw, (w * z).sum(axis) / sw
+    rc, zc = rho - np.expand_dims(rm, axis), z - np.expand_dims(zm, axis)
+    b = np.tan(0.5 * np.arctan2(2 * (w * rc * zc).sum(axis), (w * rc ** 2).sum(axis) - (w * zc ** 2).sum(axis)))
+    return b, zm - b * rm
+
+
+def pca_hits(d, strips, w0):
+    rho, z, w = [], [], []
+    for l in range(1, 11):
+        q, pos, _ = readout(d, l, l in strips)
+        shift = barycentre(d, l, l in strips)[1]
+        rho.append(np.full(q.shape, d["rho"][l]))
+        z.append(d["rho"][l] / np.tan(OFFSET + GRID * (d["u0"][:, None] + pos - shift[:, None])))
+        w.append(q)
+    rho, z, w = np.concatenate(rho, 1), np.concatenate(z, 1), np.concatenate(w, 1)
+    if w0 is not None:
+        w = log_weights(w, w.sum(1), w0)
+    return principal_axis(rho, z, w, 1)
 
 
 @lru_cache(None)
-def pointing(conf, E, strips):
+def pointing(conf, E, strips, method="fit", w0=W0):
     d = load(conf, "gamma", E)
-    S = np.zeros((5, len(d["u"])))
-    for l in range(1, 11):
-        ok = d["prof"][:, l].sum(1) > 0.01 * E
-        if (ok & d["even"]).sum() < 50:
-            continue
-        z = dz(d, l, l in strips)
-        w = ok / h68(z[ok & d["even"]]) ** 2
-        r = d["rho"][l]
-        z = z + r / np.tan(d["theta"])
-        S += [w, w * r, w * z, w * r * r, w * r * z]
-    sw, sx, sy, sxx, sxy = S
-    b = (sw * sxy - sx * sy) / (sw * sxx - sx ** 2)
-    z0 = (sy - b * sx) / sw
+    if method.startswith("pca_hits"):
+        b, z0 = pca_hits(d, strips, w0 if method == "pca_hits_log" else None)
+    else:
+        rho, z, w = [], [], []
+        for l in range(1, 11):
+            El = d["prof"][:, l].sum(1)
+            good = El > 0.01 * E
+            if (good & d["even"]).sum() < 50:
+                continue
+            dzl = dz(d, l, l in strips, w0 if method == "log" else None)
+            good &= np.isfinite(dzl)
+            sigma = h68(dzl[good & d["even"]])
+            if method in ("fit", "vertex"):
+                w.append(good / sigma ** 2)
+            elif method == "pca_layer":
+                w.append(good * El)
+            else:
+                w.append(good * El / (sigma ** 2 * El[good & d["even"]].mean()))
+            rho.append(np.full(len(El), d["rho"][l]))
+            z.append(d["rho"][l] / np.tan(d["theta"]) + np.nan_to_num(dzl))
+        rho, z, w = np.array(rho), np.array(z), np.array(w)
+        if method == "vertex":
+            b, z0 = (w * rho * z).sum(0) / (w * rho ** 2).sum(0), np.full(len(d["u"]), np.nan)
+        elif method == "pca_layer":
+            b, z0 = principal_axis(rho, z, w, 0)
+        else:
+            sw, sx, sy = w.sum(0), (w * rho).sum(0), (w * z).sum(0)
+            b = (sw * (w * rho * z).sum(0) - sx * sy) / (sw * (w * rho ** 2).sum(0) - sx ** 2)
+            z0 = (sy - b * sx) / sw
     odd = ~d["even"]
     return h68((np.arctan2(1, b) - d["theta"])[odd]) * 1e3, h68(z0[odd]) * 10
 
@@ -330,6 +387,38 @@ def plot_lateral_designs():
     save(fig, "03d_two_peaks_per_design", "Two maxima seen in layers 1-6 (second local maximum > 10% of the first, within 16 strips)")
 
 
+def plot_log_checks():
+    shown = [DESIGNS[0], DESIGNS[3], DESIGNS[-1]]
+    for conf in CONFS:
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10), sharex=True)
+        for j, E in enumerate([20, 50]):
+            d = load(conf, "gamma", E)
+            for name, strips in shown:
+                for w0, ls in [(None, "-"), (W0, "--")]:
+                    rms, sz = [], []
+                    for l in range(1, 11):
+                        q, pos, _ = readout(d, l, l in strips)
+                        c = pos[np.arange(len(q)), np.argmax(np.where(np.abs(pos) <= 12, q, -1e9), 1)]
+                        q = np.where(np.abs(pos - c[:, None]) <= 16, q, 0)
+                        w = q if w0 is None else log_weights(q, q.sum(1), w0)
+                        sw = np.maximum(w.sum(1), 1e-12)
+                        b = (w * pos).sum(1) / sw
+                        ok = d["prof"][:, l].sum(1) > 0.005 * E
+                        rms.append(np.median(np.sqrt((w * (pos - b[:, None]) ** 2).sum(1) / sw)[ok]) * GRID * d["rho"][l] * 10)
+                        sz.append(h68(dz(d, l, l in strips, w0)[ok & ~d["even"]]) * 10)
+                    st = dict(style(strips), ls=ls)
+                    lab = f"{name}, {'linear (+S-curve)' if w0 is None else f'log, W0={W0}'}"
+                    axs[0, j].plot(range(1, 11), rms, label=lab, **st)
+                    axs[1, j].plot(range(1, 11), sz, label=lab, **st)
+            axs[0, j].set(title=f"$\\gamma$ {E} GeV", ylabel="median RMS in z with these weights [mm]")
+            axs[1, j].set(xlabel="layer", ylabel="z resolution of the layer barycentre [mm]", yscale="log", xticks=range(1, 11))
+        axs[0, 0].legend(fontsize=8)
+        for ax in axs.ravel():
+            ax.grid(alpha=0.3, which="both")
+        save(fig, f"03e_log_vs_linear_weights_{conf}", "Shower shape with linear weights (solid; position S-corrected) "
+             f"and log weights (dashed, W0={W0}) - {CONFS[conf]}")
+
+
 def plot_unconverted():
     Es = [1, 5, 20, 50, 100]
     col = ecolors(Es)
@@ -447,6 +536,58 @@ def plot_pointing():
          "each read with the granularity of the design (no noise)")
 
 
+def plot_pointing_methods():
+    for conf in CONFS:
+        fig, axs = plt.subplots(2, len(METHODS), figsize=(5 * len(METHODS), 10), sharex=True, sharey="row")
+        for j, (method, title) in enumerate(METHODS.items()):
+            for name, strips in DESIGNS:
+                r = np.array([pointing(conf, E, strips, method) for E in ENERGIES])
+                axs[0, j].plot(ENERGIES, r[:, 0], label=name, **style(strips))
+                axs[1, j].plot(ENERGIES, r[:, 1], label=name, **style(strips))
+                print(conf, method, name, np.round(r[:, 0], 1), flush=True)
+            axs[0, j].set(title=title, yscale="log")
+            axs[1, j].set(xlabel="E$_\\gamma$ [GeV]", xscale="log", yscale="log")
+        axs[0, 0].set_ylabel("$\\sigma_\\theta$ [mrad]")
+        axs[1, 0].set_ylabel("$\\sigma_{z_0}$ [mm] (not defined with the vertex constraint)")
+        axs[0, 0].legend(fontsize=8)
+        for ax in axs.ravel():
+            ax.grid(alpha=0.3, which="both")
+        save(fig, f"07b_pointing_methods_{conf}", f"Photon pointing with different methods, per design - {CONFS[conf]}")
+
+        shown = [DESIGNS[i] for i in (0, 1, 2, 3, -1)]
+        fig, axs = plt.subplots(2, len(shown), figsize=(5 * len(shown), 9), sharex=True, sharey="row")
+        for j, (name, strips) in enumerate(shown):
+            ref = np.array([pointing(conf, E, strips)[0] for E in ENERGIES])
+            for k, (method, title) in enumerate(METHODS.items()):
+                r = np.array([pointing(conf, E, strips, method)[0] for E in ENERGIES])
+                axs[0, j].plot(ENERGIES, r, "o-", color=f"C{k}", label=title)
+                axs[1, j].plot(ENERGIES, r / ref, "o-", color=f"C{k}")
+            axs[0, j].set(title=name, yscale="log")
+            axs[1, j].set(xlabel="E$_\\gamma$ [GeV]", xscale="log")
+            axs[1, j].axhline(1, color="k", lw=0.8)
+        axs[0, 0].set_ylabel("$\\sigma_\\theta$ [mrad]")
+        axs[1, 0].set_ylabel("$\\sigma_\\theta$ / $\\sigma_\\theta$ (line fit, 07)")
+        axs[0, 0].legend(fontsize=8)
+        for ax in axs.ravel():
+            ax.grid(alpha=0.3, which="both")
+        save(fig, f"07c_pointing_method_comparison_{conf}", f"Pointing methods compared, design by design - {CONFS[conf]}")
+
+    w0s = [2, 3, 4, 5, 6, 7]
+    shown = [DESIGNS[0], DESIGNS[1], DESIGNS[3], DESIGNS[-1]]
+    fig, axs = plt.subplots(2, 4, figsize=(24, 10), sharex=True)
+    for i, conf in enumerate(CONFS):
+        for j, (method, E) in enumerate([("log", 10), ("log", 50), ("pca_hits_log", 10), ("pca_hits_log", 50)]):
+            for name, strips in shown:
+                axs[i, j].plot(w0s, [pointing(conf, E, strips, method, w0)[0] for w0 in w0s], label=name, **style(strips))
+            axs[i, j].set(title=f"{CONFS[conf]}\n{'log-weight barycentres + fit' if method == 'log' else 'PCA of S-corrected hits, log weights'}, "
+                                f"$\\gamma$ {E} GeV", ylabel="$\\sigma_\\theta$ [mrad]")
+            axs[i, j].grid(alpha=0.3)
+    for ax in axs[1]:
+        ax.set_xlabel("W0")
+    axs[0, 0].legend(fontsize=8)
+    save(fig, "07d_pointing_w0_scan", "Scan of the log-weight parameter W0 (cells below exp(-W0) of the energy get zero weight)")
+
+
 def plot_energy():
     fig, axs = plt.subplots(1, 4, figsize=(26, 5.5))
     res = {}
@@ -500,8 +641,10 @@ if __name__ == "__main__":
     plot_events()
     plot_lateral()
     plot_lateral_designs()
+    plot_log_checks()
     plot_unconverted()
     plot_pid()
     plot_pointing()
+    plot_pointing_methods()
     plot_energy()
     print("done", OUT)

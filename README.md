@@ -51,13 +51,30 @@ Designs compared:
 - single gamma and pi0 events as seen by each design, and the ratio of the mean z development;
 - lateral width per layer: true shape at strip granularity (vs X0 and vs layer), the width each design actually
   measures, the z resolution of each layer's barycentre, and how often a design sees two separate peaks;
+- the same shower-shape checks with log weights instead of linear ones. With strips narrower than the shower core
+  the linear barycentre has little S-curve, so log weights mostly give more weight to the tails; with 4-strip cells
+  they are an alternative to the S-curve correction, not something to add on top of it;
 - fraction of photons that reach a layer before they start to shower;
 - gamma/pi0 separation: a BDT on lateral-shape variables of layers 1-6 (Eratio, valley depth, widths, f_side, E2/E,
   computed on the 4-strip cells and, where the design has them, on the strips) plus the longitudinal fractions of
   layers 0-6. 2-fold cross-validated. Plots: pi0 rejection at 90% photon efficiency, ROC curves, score
   distributions, input variables, permutation importance;
-- photon pointing: weighted straight-line fit z = z0 + rho*cot(theta) to the barycentres of layers 1-10, each read
-  with the granularity of the design and corrected for the S-curve; gives sigma_theta and sigma_z0;
+- photon pointing, with several methods so they can be compared:
+  - line fit (the main one, as ATLAS does it): energy-weighted barycentre of each layer 1-10, read with the
+    granularity of the design and corrected for the S-curve, then a weighted straight-line fit z = z0 + rho*cot(theta)
+    with weight 1/sigma_l^2 per layer (sigma_l averaged over the events); gives sigma_theta and sigma_z0;
+  - the same fit with per-event layer weights (the error of a layer scaled as 1/sqrt(E_layer) of that event);
+  - the same fit forced through z = 0 (vertex known): sigma_theta then becomes position resolution / radius,
+    well below 1 mrad, a different scale from the free fit;
+  - log-weighted barycentres (W0 = 4, the usual value from Awes et al.; ATLAS itself uses linear weights plus the
+    S-curve correction) followed by the line fit;
+  - principal axis (PCA), always after the S-curve correction, in two ways: on the corrected barycentre of each
+    layer weighted with the layer energy, and on all the hits of the cluster, each shifted by the S-curve correction
+    of its layer in that event, with energy or log weights. Unlike the line fit, the PCA minimises the perpendicular
+    distance of the points from the axis;
+  - a scan of W0 between 2 and 7 for the log-weighted methods.
+  The radial position of a cell is the centre of its layer, so the depth of the shower inside a layer cannot be
+  used event by event;
 - energy: response and resolution of the leading sliding-window cluster for the two configurations, and the check
   that the resolution does not depend on where the strips are.
 
